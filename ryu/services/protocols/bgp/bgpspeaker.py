@@ -97,6 +97,7 @@ from ryu.services.protocols.bgp.rtconf.base import CAP_MBGP_VPNV6FS
 from ryu.services.protocols.bgp.rtconf.base import CAP_MBGP_L2VPNFS
 from ryu.services.protocols.bgp.rtconf.base import CAP_ENHANCED_REFRESH
 from ryu.services.protocols.bgp.rtconf.base import CAP_FOUR_OCTET_AS_NUMBER
+from ryu.services.protocols.bgp.rtconf.base import HOLD_TIME
 from ryu.services.protocols.bgp.rtconf.base import MULTI_EXIT_DISC
 from ryu.services.protocols.bgp.rtconf.base import SITE_OF_ORIGINS
 from ryu.services.protocols.bgp.rtconf.neighbors import (
@@ -110,6 +111,7 @@ from ryu.services.protocols.bgp.rtconf.neighbors import (
     DEFAULT_CAP_MBGP_VPNV4FS,
     DEFAULT_CAP_MBGP_VPNV6FS,
     DEFAULT_CAP_MBGP_L2VPNFS,
+    DEFAULT_HOLD_TIME,
 )
 from ryu.services.protocols.bgp.rtconf.neighbors import (
     DEFAULT_CAP_ENHANCED_REFRESH, DEFAULT_CAP_FOUR_OCTET_AS_NUMBER)
@@ -334,8 +336,8 @@ class BGPSpeaker(object):
             self._peer_down_handler(remote_ip, remote_as)
 
     def _notify_peer_up(self, peer):
-        remote_ip = peer.protocol.recv_open_msg.bgp_identifier
-        remote_as = peer.protocol.recv_open_msg.my_as
+        remote_ip = peer.ip_address
+        remote_as = peer.remote_as
         if self._peer_up_handler:
             self._peer_up_handler(remote_ip, remote_as)
 
@@ -401,7 +403,8 @@ class BGPSpeaker(object):
                      is_next_hop_self=DEFAULT_IS_NEXT_HOP_SELF,
                      local_address=None,
                      local_port=None, local_as=None,
-                     connect_mode=DEFAULT_CONNECT_MODE):
+                     connect_mode=DEFAULT_CONNECT_MODE,
+                     hold_time=DEFAULT_HOLD_TIME):
         """ This method registers a new neighbor. The BGP speaker tries to
         establish a bgp session with the peer (accepts a connection
         from the peer and also tries to connect to it).
@@ -485,6 +488,9 @@ class BGPSpeaker(object):
         - CONNECT_MODE_ACTIVE         = 'active'
         - CONNECT_MODE_PASSIVE        = 'passive'
         - CONNECT_MODE_BOTH (default) = 'both'
+
+        ``hold_time`` specifies the time after which a peer is considered
+        down if no update or keepalive has been received.
         """
         bgp_neighbor = {
             neighbors.IP_ADDRESS: address,
@@ -507,6 +513,7 @@ class BGPSpeaker(object):
             CAP_MBGP_VPNV4FS: enable_vpnv4fs,
             CAP_MBGP_VPNV6FS: enable_vpnv6fs,
             CAP_MBGP_L2VPNFS: enable_l2vpnfs,
+            HOLD_TIME: hold_time,
         }
 
         if multi_exit_disc:

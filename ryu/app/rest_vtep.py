@@ -251,6 +251,12 @@ def to_str_list(l):
     return str_list
 
 
+def str_or_none(s):
+    if s is None:
+        return None
+    return str(s)
+
+
 # Exception classes related to OpenFlow and OVSDB
 
 class RestApiException(RyuException):
@@ -352,12 +358,13 @@ class EvpnNetwork(StringifyMixin):
 
     def get_clients(self, **kwargs):
         l = []
-        for _, c in self.clients.items():
-            for k, v in kwargs.items():
-                if getattr(c, k) != v:
-                    break
-            else:
-                l.append(c)
+        for _, clients in self.clients.items():
+            for _, c in clients.items():
+                for k, v in kwargs.items():
+                    if getattr(c, k) != v:
+                        break
+                else:
+                    l.append(c)
         return l
 
 
@@ -642,11 +649,16 @@ class RestVtep(app_manager.RyuApp):
             arp_tpa=ev.path.nlri.ip_addr,
             arp_tha=ev.path.nlri.mac_addr)
 
-        network.clients[ev.path.nlri.mac_addr] = EvpnClient(
+        mac = ev.path.nlri.mac_addr
+        client = EvpnClient(
             port=vxlan_port,
             mac=ev.path.nlri.mac_addr,
             ip=ev.path.nlri.ip_addr,
             next_hop=ev.nexthop)
+        if mac not in network.clients:
+            network.clients[mac] = {client.ip: client}
+        else:
+            network.clients[mac].update({client.ip: client})
 
     def _evpn_incl_mcast_etag_route_handler(self, ev):
         # Note: For the VLAN Based service, we use RT(=RD) assigned
@@ -694,9 +706,15 @@ class RestVtep(app_manager.RyuApp):
             self.logger.debug('No such datapath: %s', self.speaker.dpid)
             return
 
-        client = network.clients.get(ev.path.nlri.mac_addr, None)
-        if client is None:
+        clients = network.clients.get(ev.path.nlri.mac_addr, None)
+        if clients is None:
             self.logger.debug('No such client: %s', ev.path.nlri.mac_addr)
+            return
+
+        client = clients.get(ev.path.nlri.ip_addr, None)
+        if client is None:
+            self.logger.debug('No such client: %s:%s',
+                              (ev.path.nlri.mac_addr, ev.path.nlri.ip_addr))
             return
 
         self._del_l2_switching_flow(
@@ -709,7 +727,7 @@ class RestVtep(app_manager.RyuApp):
             tag=network.vni,
             arp_tpa=ev.path.nlri.ip_addr)
 
-        network.clients.pop(ev.path.nlri.mac_addr)
+        network.clients[ev.path.nlri.mac_addr].pop(ev.path.nlri.ip_addr)
 
     def _evpn_withdraw_incl_mcast_etag_route_handler(self, ev):
         # Note: For the VLAN Based service, we use RT(=RD) assigned
@@ -875,7 +893,8 @@ class RestVtep(app_manager.RyuApp):
 
         return {address: neighbor.to_jsondict()}
 
-    def add_network(self, vni):
+    def add_network(self, vni, nexthop=None):
+        nexthop = nexthop or self.speaker.router_id
         if self.speaker is None:
             raise BGPSpeakerNotFound()
 
@@ -894,8 +913,8 @@ class RestVtep(app_manager.RyuApp):
             route_type=EVPN_MULTICAST_ETAG_ROUTE,
             route_dist=route_dist,
             ethernet_tag_id=vni,
-            ip_addr=self.speaker.router_id,
-            next_hop=self.speaker.router_id)
+            ip_addr=nexthop,
+            next_hop=nexthop)
 
         network = EvpnNetwork(
             vni=vni,
@@ -936,7 +955,8 @@ class RestVtep(app_manager.RyuApp):
         for client in network.get_clients(next_hop=self.speaker.router_id):
             self.del_client(
                 vni=vni,
-                mac=client.mac)
+                mac=client.mac,
+                ip=client.ip)
 
         self._del_network_egress_flow(
             datapath=datapath,
@@ -960,7 +980,8 @@ class RestVtep(app_manager.RyuApp):
 
         return {vni: network.to_jsondict()}
 
-    def add_client(self, vni, port, mac, ip):
+    def add_client(self, vni, port, mac, ip, nexthop=None):
+        nexthop = nexthop or self.speaker.router_id
         if self.speaker is None:
             raise BGPSpeakerNotFound()
 
@@ -979,17 +1000,18 @@ class RestVtep(app_manager.RyuApp):
             except ValueError:
                 raise OFPortNotFound(port_name=port)
 
-        self._add_network_ingress_flow(
-            datapath=datapath,
-            tag=network.vni,
-            in_port=port,
-            eth_src=mac)
+        if mac not in network.clients:
+            self._add_network_ingress_flow(
+                datapath=datapath,
+                tag=network.vni,
+                in_port=port,
+                eth_src=mac)
 
-        self._add_l2_switching_flow(
-            datapath=datapath,
-            tag=network.vni,
-            eth_dst=mac,
-            out_port=port)
+            self._add_l2_switching_flow(
+                datapath=datapath,
+                tag=network.vni,
+                eth_dst=mac,
+                out_port=port)
 
         # Note: For the VLAN Based service, ethernet_tag_id
         # must be set to zero.
@@ -1001,7 +1023,7 @@ class RestVtep(app_manager.RyuApp):
             mac_addr=mac,
             ip_addr=ip,
             vni=vni,
-            next_hop=self.speaker.router_id,
+            next_hop=nexthop,
             tunnel_type='vxlan')
 
         # Stores local client info
@@ -1009,12 +1031,16 @@ class RestVtep(app_manager.RyuApp):
             port=port,
             mac=mac,
             ip=ip,
-            next_hop=self.speaker.router_id)
-        network.clients[mac] = client
+            next_hop=nexthop)
+
+        if mac not in network.clients:
+            network.clients[mac] = {client.ip: client}
+        else:
+            network.clients[mac].update({client.ip: client})
 
         return {vni: client.to_jsondict()}
 
-    def del_client(self, vni, mac):
+    def del_client(self, vni, mac, ip=None):
         if self.speaker is None:
             raise BGPSpeakerNotFound()
 
@@ -1026,35 +1052,52 @@ class RestVtep(app_manager.RyuApp):
         if network is None:
             raise VniNotFound(vni=vni)
 
-        client = network.clients.get(mac, None)
-        if client is None:
+        clients = network.clients.get(mac, None)
+        if clients is None:
             raise ClientNotFound(mac=mac)
-        elif client.next_hop != self.speaker.router_id:
+
+        if ip is not None:
+            client = clients.get(ip, None)
+            if client is None:
+                raise ClientNotFound(mac=mac)
+            clients = {client.ip: client}
+
+        if all(c.next_hop != self.speaker.router_id for c in clients.values()):
             raise ClientNotLocal(mac=mac)
 
-        self._del_network_ingress_flow(
-            datapath=datapath,
-            in_port=client.port,
-            eth_src=mac)
+        if ip is None or len(network.clients.get(mac, None)) == 1:
+            # last address on this MAC so remove flow rules
+            port = network.clients.get(mac).values()[0].port
+            self._del_network_ingress_flow(
+                datapath=datapath,
+                in_port=port,
+                eth_src=mac)
 
-        self._del_l2_switching_flow(
-            datapath=datapath,
-            tag=network.vni,
-            eth_dst=mac)
+            self._del_l2_switching_flow(
+                datapath=datapath,
+                tag=network.vni,
+                eth_dst=mac)
 
-        # Note: For the VLAN Based service, ethernet_tag_id
-        # must be set to zero.
-        self.speaker.evpn_prefix_del(
-            route_type=EVPN_MAC_IP_ADV_ROUTE,
-            route_dist=network.route_dist,
-            esi=0,
-            ethernet_tag_id=0,
-            mac_addr=mac,
-            ip_addr=client.ip)
+        removed = []
+        for client in clients.values():
+            if client.next_hop != self.speaker.router_id:
+                continue
+            # Note: For the VLAN Based service, ethernet_tag_id
+            # must be set to zero.
+            self.speaker.evpn_prefix_del(
+                route_type=EVPN_MAC_IP_ADV_ROUTE,
+                route_dist=network.route_dist,
+                esi=0,
+                ethernet_tag_id=0,
+                mac_addr=mac,
+                ip_addr=client.ip)
 
-        client = network.clients.pop(mac)
+            removed.append(network.clients[mac].pop(client.ip))
 
-        return {vni: client.to_jsondict()}
+        if len(network.clients[mac]) == 0:
+            del network.clients[mac]
+
+        return {vni: [c.to_jsondict() for c in removed]}
 
 
 def post_method(keywords):
@@ -1469,6 +1512,7 @@ class RestVtepController(ControllerBase):
     @post_method(
         keywords={
             "vni": to_int,
+            "nexthop": str_or_none,
         })
     def add_network(self, **kwargs):
         """
@@ -1689,10 +1733,14 @@ class RestVtepController(ControllerBase):
             "port": str,
             "mac": str,
             "ip": str,
+            "nexthop": str_or_none,
         })
     def add_client(self, **kwargs):
         """
-        Registers a new client to the specified network.
+        Registers a new client to the specified network.  If the MAC address
+        is already registered to another client with a different IP then a new
+        client is inserted to the list of clients behind the specified MAC
+        address.
 
         Usage:
 
@@ -1715,6 +1763,7 @@ class RestVtepController(ControllerBase):
             mac         Client MAC address to register.
                         (e.g. "aa:bb:cc:dd:ee:ff")
             ip          Client IP address. (e.g. "10.0.0.1")
+            nexthop     Nexthop IP address (optional)
             =========== ===============================================
 
         Example::
@@ -1722,7 +1771,8 @@ class RestVtepController(ControllerBase):
             $ curl -X POST -d '{
              "port": "s1-eth1",
              "mac": "aa:bb:cc:dd:ee:ff",
-             "ip": "10.0.0.1"
+             "ip": "10.0.0.1",
+             "nexthop": "192.168.0.1"
              }' http://localhost:8080/vtep/networks/10/clients |
              python -m json.tool
 
@@ -1756,7 +1806,9 @@ class RestVtepController(ControllerBase):
         })
     def del_client(self, **kwargs):
         """
-        Registers a new client to the specified network.
+        Deletes clients by MAC address on a specified network.  If multiple
+        clients, each with a unique IP address, exist then they will all be
+        deleted.
 
         Usage:
 
@@ -1772,7 +1824,7 @@ class RestVtepController(ControllerBase):
             Attribute   Description
             =========== ===============================================
             vni         Virtual Network Identifier. (e.g. 10)
-            mac         Client MAC address to register.
+            mac         Client MAC address to delete.
             =========== ===============================================
 
         Example::
@@ -1784,12 +1836,12 @@ class RestVtepController(ControllerBase):
 
             {
                 "10": {
-                    "EvpnClient": {
+                    ["EvpnClient": {
                         "ip": "10.0.0.1",
                         "mac": "aa:bb:cc:dd:ee:ff",
                         "next_hop": "172.17.0.1",
                         "port": 1
-                    }
+                     }]
                 }
             }
         """
